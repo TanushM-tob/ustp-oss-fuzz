@@ -1,0 +1,201 @@
+#!/usr/bin/make -f
+
+# AFL++ Makefile for ustp fuzz target (ustp-fuzz)
+# Based on relayd AFL++ Makefile pattern
+
+# -----------------------------------------------------------------------------
+# 1. Compiler
+# -----------------------------------------------------------------------------
+CC := afl-clang-lto
+
+# -----------------------------------------------------------------------------
+# 2. Paths & flags
+# -----------------------------------------------------------------------------
+DEPS_DIR := $(abspath $(CURDIR)/deps)
+INSTALL_PREFIX := $(DEPS_DIR)/install
+CFLAGS_BASE := -O2 -fPIC -std=gnu99 -g -Wall -D_GNU_SOURCE -DDUMMY_MODE=1 -UPACKET_DEBUG -D__AFL_COMPILER
+CFLAGS := $(CFLAGS_BASE) -I$(INSTALL_PREFIX)/include -I$(CURDIR)
+LDFLAGS := -L$(INSTALL_PREFIX)/lib
+
+# -----------------------------------------------------------------------------
+# 3. Sources
+# -----------------------------------------------------------------------------
+CORE_SRC := bridge_track.c brmon.c hmac_md5.c libnetlink.c mstp.c netif_utils.c packet.c worker.c config.c
+MISSING_FUNCS_SRC := missing_funcs.c
+FUZZER_SRC := ustp-fuzz.c
+
+OBJ_DIR := obj
+CORE_OBJ := $(CORE_SRC:%.c=$(OBJ_DIR)/%.o)
+MISSING_FUNCS_OBJ := $(OBJ_DIR)/missing_funcs.o
+FUZZER_OBJ := $(OBJ_DIR)/fuzzer.o
+
+FUZZER_BIN := ustp_afl_fuzzer
+
+# -----------------------------------------------------------------------------
+# 4. Top-level targets
+# -----------------------------------------------------------------------------
+.PHONY: all deps clean distclean help
+all: deps $(FUZZER_BIN)
+
+# -----------------------------------------------------------------------------
+# 5. Dependencies (libubox, libubus, libblobmsg_json)
+# -----------------------------------------------------------------------------
+DEPS_LIBS := $(INSTALL_PREFIX)/lib/libubox.a $(INSTALL_PREFIX)/lib/libubus.a $(INSTALL_PREFIX)/lib/libblobmsg_json.a
+
+deps: $(DEPS_LIBS)
+	@echo "✓ Dependencies built"
+
+$(INSTALL_PREFIX)/lib/libubox.a $(INSTALL_PREFIX)/lib/libblobmsg_json.a:
+	@echo "[libubox] building"
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(DEPS_DIR)/libubox" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/libubox.git; \
+	fi
+	@cd $(DEPS_DIR)/libubox && rm -rf tests examples lua || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*lua/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" -DCMAKE_C_COMPILER="$(CC)" \
+		      -DCMAKE_C_FLAGS="-O2 -fPIC -g" -DBUILD_STATIC=ON -DBUILD_SHARED_LIBS=OFF \
+		      -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF && make -j$$(nproc) && make install
+	@# Ensure libblobmsg_json.a is copied if built separately
+	@if [ -f "$(DEPS_DIR)/libubox/build/libblobmsg_json.a" ] && [ ! -f "$(INSTALL_PREFIX)/lib/libblobmsg_json.a" ]; then \
+		cp "$(DEPS_DIR)/libubox/build/libblobmsg_json.a" "$(INSTALL_PREFIX)/lib/"; \
+	fi
+
+$(INSTALL_PREFIX)/lib/libubus.a:
+	@echo "[libubus] building"
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(DEPS_DIR)/ubus" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/ubus.git; \
+	fi
+	@cd $(DEPS_DIR)/ubus && rm -rf tests examples || true
+	@cd $(DEPS_DIR)/ubus && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/ubus && mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" -DCMAKE_C_COMPILER="$(CC)" \
+		      -DCMAKE_C_FLAGS="-O2 -fPIC -g" -DCMAKE_EXE_LINKER_FLAGS="-lrt" \
+		      -DBUILD_STATIC=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_LUA=OFF \
+		      -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+		make -j$$(nproc) && make install
+	@# Create static library manually if not created by build system
+	@if [ ! -f "$(INSTALL_PREFIX)/lib/libubus.a" ]; then \
+		echo "Creating static library for libubus..."; \
+		cd $(DEPS_DIR)/ubus/build && ar rcs "$(INSTALL_PREFIX)/lib/libubus.a" CMakeFiles/ubus.dir/*.o; \
+	fi
+
+# -----------------------------------------------------------------------------
+# 6. Generate missing_funcs.c (stub functions for missing symbols)
+# -----------------------------------------------------------------------------
+$(MISSING_FUNCS_SRC):
+	@echo "[ustp] Generating missing functions stub"
+	@echo '#include <stdio.h>' > $@
+	@echo '#include <stdarg.h>' >> $@
+	@echo '#include <sys/socket.h>' >> $@
+	@echo '#include <sys/un.h>' >> $@
+	@echo '#include <netinet/in.h>' >> $@
+	@echo '#include <unistd.h>' >> $@
+	@echo '#include <errno.h>' >> $@
+	@echo '#include <string.h>' >> $@
+	@echo '' >> $@
+	@echo 'int log_level = 0;' >> $@
+	@echo '' >> $@
+	@echo 'void Dprintf(int level, const char *fmt, ...) {' >> $@
+	@echo '    // Completely disabled for fuzzing - no output' >> $@
+	@echo '    (void)level;' >> $@
+	@echo '    (void)fmt;' >> $@
+	@echo '}' >> $@
+	@echo '' >> $@
+	@echo '// usock implementation' >> $@
+	@echo 'int usock(int type, const char *host, const char *service) {' >> $@
+	@echo '    int fd = socket(AF_UNIX, SOCK_STREAM, 0);' >> $@
+	@echo '    if (fd < 0) {' >> $@
+	@echo '        return -1;' >> $@
+	@echo '    }' >> $@
+	@echo '    // For fuzzing, just return the socket - do not actually connect' >> $@
+	@echo '    return fd;' >> $@
+	@echo '}' >> $@
+	@echo '' >> $@
+	@echo 'void ustp_ubus_init(void) {' >> $@
+	@echo '}' >> $@
+	@echo '' >> $@
+	@echo 'void ustp_ubus_exit(void) {' >> $@
+	@echo '}' >> $@
+
+# -----------------------------------------------------------------------------
+# 7. Compilation rules
+# -----------------------------------------------------------------------------
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(MISSING_FUNCS_OBJ): $(MISSING_FUNCS_SRC) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(FUZZER_OBJ): $(FUZZER_SRC) deps | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Wno-error=implicit-function-declaration -c $< -o $@
+
+# -----------------------------------------------------------------------------
+# 8. Linking
+# -----------------------------------------------------------------------------
+# Find static json-c library
+JSON_C_STATIC := $(shell \
+	if pkg-config --exists json-c 2>/dev/null; then \
+		libdir=$$(pkg-config --variable=libdir json-c 2>/dev/null); \
+		if [ -f "$$libdir/libjson-c.a" ]; then \
+			echo "$$libdir/libjson-c.a"; \
+		fi; \
+	fi)
+
+# Fallback locations for static json-c
+ifeq ($(JSON_C_STATIC),)
+JSON_C_STATIC := $(shell \
+	for path in /usr/lib/x86_64-linux-gnu/libjson-c.a /usr/lib/libjson-c.a /usr/local/lib/libjson-c.a; do \
+		if [ -f "$$path" ]; then \
+			echo "$$path"; \
+			break; \
+		fi; \
+	done)
+endif
+
+# Use dynamic linking as last resort
+ifeq ($(JSON_C_STATIC),)
+JSON_C_STATIC := -ljson-c
+$(warning Could not find static libjson-c.a, using dynamic linking)
+endif
+
+$(FUZZER_BIN): $(CORE_OBJ) $(MISSING_FUNCS_OBJ) $(FUZZER_OBJ)
+	@echo "Using JSON-C library: $(JSON_C_STATIC)"
+	$(CC) $(CFLAGS) $(CORE_OBJ) $(MISSING_FUNCS_OBJ) $(FUZZER_OBJ) $(LDFLAGS) \
+		-lubox -lblobmsg_json $(JSON_C_STATIC) -lpthread -lrt -o $@
+	@echo "✓ Built: $@"
+
+# -----------------------------------------------------------------------------
+# 9. Convenience targets
+# -----------------------------------------------------------------------------
+clean:
+	rm -rf $(OBJ_DIR) $(FUZZER_BIN) $(MISSING_FUNCS_SRC)
+
+distclean: clean
+	rm -rf $(DEPS_DIR)
+
+help:
+	@echo "AFL++ ustp fuzzer Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all           - Build fuzzer (default)"
+	@echo "  deps          - Build dependencies only"
+	@echo "  clean         - Remove build artifacts"
+	@echo "  distclean     - Remove build artifacts and dependencies"
+	@echo "  help          - Show this help"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make all      - Build the ustp AFL++ fuzzer"
+	@echo "  make clean    - Clean build artifacts"
+	@echo ""
+	@echo "Dependencies:"
+	@echo "  - libubox (OpenWrt utility library)"
+	@echo "  - libubus (OpenWrt bus library)"
+	@echo "  - libblobmsg_json (JSON blob message library)"
+	@echo "  - libjson-c (JSON-C library - system package)"
