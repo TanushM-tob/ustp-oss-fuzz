@@ -91,14 +91,45 @@ if [ ! -f "$DEPS_DIR/install/lib/libblobmsg_json.a" ]; then
     cd "$DEPS_DIR"
 fi
 
-# Go to the ustp-fuzz directory
-cd "$SRC/ustp-fuzz"
+# Go to the ustp-fuzz directory and find the correct source structure
+echo "Checking directory structure..."
+ls -la "$SRC/oss-fuzz-auto"
+
+# Check for git repository structure with commit hash directory
+REPO_DIR=$(find "$SRC/oss-fuzz-auto" -maxdepth 1 -name "ustp-oss-fuzz-*" -type d | head -n1)
+if [ -n "$REPO_DIR" ] && [ -d "$REPO_DIR" ]; then
+  echo "Found git repository structure with commit hash, using $REPO_DIR"
+  cd "$REPO_DIR"
+  SOURCE_DIR="$REPO_DIR"
+elif [ -f "$SRC/oss-fuzz-auto/ustp-fuzz.c" ]; then
+  echo "Found source files in mounted structure"
+  cd "$SRC/oss-fuzz-auto"
+  SOURCE_DIR="$SRC/oss-fuzz-auto"
+elif [ -d "$SRC/ustp-fuzz" ]; then
+  echo "Using legacy ustp-fuzz directory structure"
+  cd "$SRC/ustp-fuzz"
+  SOURCE_DIR="$SRC/ustp-fuzz"
+else
+  echo "Using default structure"
+  cd "$SRC/oss-fuzz-auto"
+  SOURCE_DIR="$SRC/oss-fuzz-auto"
+fi
+
+echo "Using source directory: $SOURCE_DIR"
+echo "Current working directory: $(pwd)"
+echo "Available files:"
+ls -la
 
 # Set up environment variables
 : "${CFLAGS:=-O2 -fPIC}"
 : "${LDFLAGS:=}"
 : "${PKG_CONFIG_PATH:=}"
-: "${LIB_FUZZING_ENGINE:=-fsanitize=fuzzer}"
+# The builder container passes the correct value for LIB_FUZZING_ENGINE
+# (e.g. “-fsanitize=coverage …” or “-fsanitize=fuzzer”).  Don’t
+# override it; just fall back to an empty string if it happens to be
+# unset (this is only the case when the script is run outside of the
+# OSS-Fuzz helpers).
+: "${LIB_FUZZING_ENGINE:=}"
 
 # Set up compiler flags
 export PKG_CONFIG_PATH="$DEPS_DIR/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -190,7 +221,12 @@ echo "Using JSON-C library: $JSON_C_STATIC"
 
 # Link with full paths to static libraries to avoid linker issues
 # Note: Exclude libubus.a to avoid conflicts and use our stub functions instead
-$CC $CFLAGS $LIB_FUZZING_ENGINE ustp-fuzz.o \
+LINK_FLAGS=""
+if [ -n "${LIB_FUZZING_ENGINE}" ]; then
+  LINK_FLAGS="${LIB_FUZZING_ENGINE}"
+fi
+
+$CC $CFLAGS ${LINK_FLAGS} ustp-fuzz.o \
     bridge_track.o brmon.o hmac_md5.o libnetlink.o mstp.o \
     netif_utils.o packet.o worker.o config.o missing_funcs.o \
     $DEPS_DIR/install/lib/libubox.a \
